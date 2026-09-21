@@ -1,0 +1,30 @@
+[package]
+name = "cosmic-applet-sysmon"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "COSMIC panel applet showing CPU load, RAM, GPU VRAM and power draw with a one-hour history popup"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "d4d71fd53e5ed6bd3a430089114dffa2da3cd498", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "dbus-config",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "winit",
+] }
+serde_json = "1.0.151"
+# Only for `kill(2)`: the process page signals processes, and std does not
+# expose signals.
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "thin"

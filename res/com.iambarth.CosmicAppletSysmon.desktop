@@ -1,0 +1,17 @@
+[Desktop Entry]
+Name=System Monitor
+Name[de]=System-Monitor
+Comment=CPU, RAM, GPU VRAM and power draw with a one-hour history
+Comment[de]=CPU, RAM, GPU-VRAM und Leistungsaufnahme mit Verlauf der letzten Stunde
+Type=Application
+Exec=cosmic-applet-sysmon
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;System;Monitor;CPU;RAM;GPU;VRAM;Power;Watt;
+Keywords[de]=COSMIC;Applet;System;Monitor;CPU;RAM;GPU;VRAM;Leistung;Watt;
+Icon=com.iambarth.CosmicAppletSysmon-symbolic
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-HostWaylandDisplay=true
+X-CosmicHoverPopup=Auto

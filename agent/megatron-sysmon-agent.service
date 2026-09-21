@@ -1,0 +1,37 @@
+[Unit]
+Description=Megatron Sysmon Agent (node and vLLM metrics over WebSocket)
+Documentation=https://github.com/bitsandfriends/Megatron-System-Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__AGENT_USER__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=__EXEC__
+Restart=always
+RestartSec=5
+
+# Keep the agent out of the way of the inference workload.
+Nice=15
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+MemoryMax=256M
+TasksMax=32
+
+# Hardening: the agent only reads /proc, /sys and the loopback metrics port.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+[package]
+name = "megatron-sysmon-agent"
+version = "2.2.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Megatron sysmon agent: node and LLM metrics over WebSocket"
+
+# Deliberately tiny dependency set: a WebSocket implementation and JSON.
+# Everything else (HTTP to loopback, /proc parsing, framing) is done here, which
+# keeps the static binary small and the memory footprint low.
+[dependencies]
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+serde_json = "1"
+# Only for `kill(2)`: the process list must be able to signal a process and std
+# does not expose signals. Everything else stays dependency-free.
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
