@@ -115,6 +115,12 @@ impl SparkConfig {
             }
         }
 
+        // A node installed twice used to land in the file twice; clean that up on
+        // every start, so the list shows each machine once.
+        let duplicates = config.deduplicate_targets();
+        if duplicates > 0 {
+            tracing::info!("removed {duplicates} duplicate node target(s)");
+        }
         config
     }
 
@@ -163,6 +169,49 @@ impl SparkConfig {
 }
 
 impl SparkConfig {
+    /// Removes targets that name the same node twice, keeping the first
+    /// spelling. Returns how many duplicates were dropped.
+    pub fn deduplicate_targets(&mut self) -> usize {
+        let before = self.targets.len();
+        let mut seen: Vec<String> = Vec::new();
+        let mut kept: Vec<String> = Vec::new();
+        for target in self.targets.drain(..) {
+            let key = canonical_target(&target);
+            if key.is_empty() || seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            kept.push(target);
+        }
+        self.targets = kept;
+        before - self.targets.len()
+    }
+
+    /// Whether `target` already names a node in the list, whatever form it is
+    /// written in (`node-01`, `node-01:8787`, `ws://node-01:8787/`).
+    pub fn contains_target(&self, target: &str) -> bool {
+        let wanted = canonical_target(target);
+        self.targets
+            .iter()
+            .any(|item| canonical_target(item) == wanted)
+    }
+
+    /// Adds a node in the canonical `host:port` form, unless it is already in the
+    /// list. Returns false when nothing changed.
+    pub fn add_target(&mut self, host: &str) -> bool {
+        let host = host.trim();
+        if host.is_empty() || self.contains_target(host) {
+            return false;
+        }
+        let entry = if host.contains(':') || host.contains('/') {
+            host.to_owned()
+        } else {
+            format!("{host}:{DEFAULT_AGENT_PORT}")
+        };
+        self.targets.push(entry);
+        true
+    }
+
     /// Writes the configuration back, so the settings view survives a restart.
     pub fn save(&self) -> std::io::Result<PathBuf> {
         let Some(path) = config_path() else {
@@ -199,6 +248,24 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("cosmic-applet-sysmon").join("spark.json"))
 }
 
+/// One graphics card as the node agent reports it.
+#[derive(Debug, Clone, Default)]
+pub struct GpuMetrics {
+    /// PCI address, e.g. `0000:03:00.0`; empty when the agent did not report one.
+    ///
+    /// The popup does not show it (the user removed that column), but it stays
+    /// part of the model: it is the stable way to tell two identical cards apart
+    /// and the agents keep sending it.
+    #[allow(dead_code)]
+    pub slot: String,
+    pub name: String,
+    pub util_pct: f32,
+    pub vram_used_mib: f64,
+    pub vram_total_mib: f64,
+    pub temp_c: f32,
+    pub power_w: f32,
+}
+
 /// Node values as pushed by one agent.
 #[derive(Debug, Clone, Default)]
 pub struct NodeMetrics {
@@ -215,6 +282,10 @@ pub struct NodeMetrics {
     pub gpu_util_pct: f32,
     pub gpu_power_w: f32,
     pub gpu_temp_c: f32,
+    /// Every card the agent reports (`gpus` array). Empty for agents older than
+    /// 2.3, which only send the aggregated `gpu` object; the aggregate values
+    /// above stay valid in that case.
+    pub gpus: Vec<GpuMetrics>,
 }
 
 /// vLLM engine values; the agent that hosts the metrics endpoint reports them.
@@ -331,6 +402,22 @@ impl AgentState {
 }
 
 impl SparkSnapshot {
+    /// Longest graphics card name any node reports, so the popup can size its
+    /// name column for local *and* remote cards.
+    pub fn longest_gpu_name(&self) -> usize {
+        self.agents
+            .iter()
+            .flat_map(|agent| agent.node.gpus.iter())
+            .map(|gpu| gpu.name.chars().count())
+            .chain(
+                self.agents
+                    .iter()
+                    .map(|agent| agent.gpu_name.chars().count()),
+            )
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn online_count(&self) -> usize {
         self.agents.iter().filter(|agent| agent.online).count()
     }
@@ -993,6 +1080,7 @@ fn apply_value(inner: &Arc<Mutex<Inner>>, index: usize, document: &Value) {
         node.gpu_util_pct = number_at(&document, &["gpu", "util_pct"]);
         node.gpu_power_w = number_at(&document, &["gpu", "power_w"]);
         node.gpu_temp_c = number_at(&document, &["gpu", "temp_c"]);
+        let gpus = gpu_items_at(document);
 
         let engine = &mut slot.state.engine;
         engine.available = flag_at(&document, &["vllm", "available"]);
@@ -1015,6 +1103,7 @@ fn apply_value(inner: &Arc<Mutex<Inner>>, index: usize, document: &Value) {
         slot.state.gpu_vram_total_mib = value_at(&document, &["gpu", "vram_total_mib"])
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        slot.state.node.gpus = gpus;
         slot.state.version = value_at(&document, &["version"])
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -1139,6 +1228,23 @@ pub(crate) fn agent_url(target: &str, token: Option<&str>) -> String {
     }
 }
 
+/// Canonical form of a node target, used to recognise a host that is already in
+/// the list: `WS://node-01:8787/` and `node-01` are the same node.
+pub fn canonical_target(target: &str) -> String {
+    let mut value = target.trim().to_lowercase();
+    for prefix in ["ws://", "wss://", "http://", "https://"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            value = rest.to_owned();
+        }
+    }
+    let value = value.trim_end_matches('/').to_owned();
+    match value.rsplit_once(':') {
+        // Drop the port when it is the default one, so `host` and `host:8787` match.
+        Some((host, port)) if port == DEFAULT_AGENT_PORT.to_string() => host.to_owned(),
+        _ => value,
+    }
+}
+
 /// Short, human readable connection error for the popup.
 pub(crate) fn short_error(message: &str) -> String {
     let message = message.trim();
@@ -1191,6 +1297,29 @@ fn flag_at(document: &Value, path: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Reads the optional `gpus` array of a pushed document.
+///
+/// Agents before version 2.3 do not send it; the caller then falls back to the
+/// aggregated `gpu` object.
+fn gpu_items_at(document: &Value) -> Vec<GpuMetrics> {
+    let Some(items) = value_at(document, &["gpus"]).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .map(|item| GpuMetrics {
+            slot: text_at(item, &["slot"]).unwrap_or_default().to_owned(),
+            name: text_at(item, &["name"]).unwrap_or_default().to_owned(),
+            util_pct: number_at(item, &["util_pct"]),
+            vram_used_mib: optional_number_at(item, &["vram_used_mib"]).unwrap_or(0.0) as f64,
+            vram_total_mib: optional_number_at(item, &["vram_total_mib"]).unwrap_or(0.0) as f64,
+            temp_c: number_at(item, &["temp_c"]),
+            power_w: number_at(item, &["power_w"]),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,6 +1364,50 @@ mod tests {
             spark_section_open: true,
         };
         (SparkMonitor::start(config.clone()), config)
+    }
+
+    #[test]
+    fn parses_a_per_card_gpu_list() {
+        let text = r#"{
+            "host": "workstation-01", "uptime_s": 12.0,
+            "node": {"cpu_pct": 5.0, "cpu_count": 16, "mem_total_gib": 64.0, "mem_used_gib": 20.0,
+                     "mem_pct": 31.0},
+            "gpu": {"available": true, "name": "AMD Radeon AI PRO R9700 (+1)", "util_pct": 8.0,
+                    "power_w": 32.0, "temp_c": 31.0, "vram_used_mib": 42000.0,
+                    "vram_total_mib": 67270.0},
+            "gpus": [
+                {"slot": "0000:03:00.0", "name": "AMD Radeon AI PRO R9700", "util_pct": 8.0,
+                 "vram_used_mib": 21700.0, "vram_total_mib": 32624.0, "temp_c": 31.0, "power_w": 16.0},
+                {"slot": "0000:07:00.0", "name": "AMD Radeon AI PRO R9700", "util_pct": 3.0,
+                 "vram_used_mib": 18700.0, "vram_total_mib": 32624.0, "temp_c": 27.0, "power_w": 16.0},
+                {"slot": "0000:7e:00.0", "name": "AMD Radeon 610M", "util_pct": 0.0,
+                 "vram_used_mib": 1840.0, "vram_total_mib": 2048.0, "temp_c": 39.0, "power_w": 0.1}
+            ]
+        }"#;
+
+        let (monitor, _config) = monitor_with(&["workstation-01"]);
+        apply_document(&monitor.inner, 0, text);
+        let snapshot = monitor.snapshot();
+
+        let node = &snapshot.agents[0].node;
+        assert_eq!(node.gpus.len(), 3);
+        assert_eq!(node.gpus[0].slot, "0000:03:00.0");
+        assert_eq!(node.gpus[2].name, "AMD Radeon 610M");
+        assert!((node.gpus[0].vram_used_mib / node.gpus[0].vram_total_mib * 100.0 - 66.5).abs() < 0.6);
+        assert_eq!(node.gpus[1].util_pct, 3.0);
+        // The aggregated values stay available for panels that use them.
+        assert!(node.gpu_available);
+        assert_eq!(node.gpu_util_pct, 8.0);
+    }
+
+    #[test]
+    fn documents_without_a_gpu_list_keep_the_aggregate() {
+        let (monitor, _config) = monitor_with(&["node-01"]);
+        apply_document(&monitor.inner, 0, DOCUMENT);
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.agents[0].node.gpus.is_empty());
+        assert!(snapshot.agents[0].node.gpu_available);
+        assert_eq!(snapshot.agents[0].node.gpu_util_pct, 42.0);
     }
 
     #[test]
@@ -1463,6 +1636,57 @@ mod tests {
         apply_document(&monitor.inner, 0, "{not json");
         let snapshot = monitor.snapshot();
         assert!(!snapshot.agents[0].online);
+    }
+
+    #[test]
+    fn duplicate_nodes_are_recognised_in_every_spelling() {
+        // The installer used to add a bare host while the list holds `host:8787`,
+        // so the same machine appeared twice — once online, once offline.
+        // Neutral example names: the public snapshot replaces several internal
+        // node names with the same placeholder, which would collapse this test.
+        let mut config = SparkConfig {
+            targets: vec![
+                "node-01:8787".to_owned(),
+                "desktop-01:8787".to_owned(),
+                "nas-01".to_owned(),
+            ],
+            ..SparkConfig::default()
+        };
+        assert!(config.contains_target("desktop-01"));
+        assert!(config.contains_target("DESKTOP-01:8787"));
+        assert!(config.contains_target("ws://nas-01:8787/"));
+        assert!(!config.contains_target("node-99"));
+
+        // Adding an already known node changes nothing…
+        assert!(!config.add_target("desktop-01"));
+        assert_eq!(config.targets.len(), 3);
+        // …and a new node is stored in the usual `host:port` form.
+        assert!(config.add_target("laptop-01"));
+        assert_eq!(config.targets.len(), 4);
+        assert!(config.targets.contains(&"laptop-01:8787".to_owned()));
+    }
+
+    #[test]
+    fn loading_removes_duplicate_targets() {
+        let mut config = SparkConfig {
+            targets: vec![
+                "desktop-01:8787".to_owned(),
+                "laptop-01".to_owned(),
+                "DESKTOP-01:8787".to_owned(),
+                "laptop-01:8787".to_owned(),
+                "nas-01".to_owned(),
+            ],
+            ..SparkConfig::default()
+        };
+        assert_eq!(config.deduplicate_targets(), 2);
+        assert_eq!(
+            config.targets,
+            vec![
+                "desktop-01:8787".to_owned(),
+                "laptop-01".to_owned(),
+                "nas-01".to_owned()
+            ]
+        );
     }
 
     #[test]

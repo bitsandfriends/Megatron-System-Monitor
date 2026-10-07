@@ -117,9 +117,12 @@ user_bus_env() {
 # An earlier installation - a system service or a root user service - can still
 # hold the port. Both run our own binary, so stopping them is safe.
 cleanup_previous_agents() {
-    if pgrep -f "megatron-sysmon-agent --bind" >/dev/null 2>&1; then
-        pkill -f "megatron-sysmon-agent --bind" >/dev/null 2>&1 || \
-            sudo -n pkill -f "megatron-sysmon-agent --bind" >/dev/null 2>&1 || true
+    # The pattern covers the Rust binary ("megatron-sysmon-agent --bind") and
+    # the Python fallback ("megatron_sysmon_agent.py --bind"): a leftover agent
+    # of either kind holds the port.
+    if pgrep -f "megatron[-_]sysmon.*--bind" >/dev/null 2>&1; then
+        pkill -f "megatron[-_]sysmon.*--bind" >/dev/null 2>&1 || \
+            sudo -n pkill -f "megatron[-_]sysmon.*--bind" >/dev/null 2>&1 || true
         sleep 1
         echo "stopped a previously running agent"
     fi
@@ -128,6 +131,31 @@ cleanup_previous_agents() {
             /root/.config/systemd/user/megatron-sysmon-agent.service >/dev/null 2>&1 || true
         echo "removed an earlier installation that ran as root"
     fi
+}
+
+# A user service from an earlier installation keeps holding the port: the new
+# system service then fails with "address already in use" while the installer
+# still sees an active unit and a listener - the old agent answering. Disable
+# and remove it before the system unit starts; do_install_user covers the
+# reverse case (leftover system unit).
+remove_previous_user_agent() {
+    local user uid home unit
+    [ "$(id -u)" -eq 0 ] || return 0
+    user="${AGENT_USER}"
+    [ -n "${user}" ] && [ "${user}" != "root" ] || return 0
+    uid="$(id -u "${user}" 2>/dev/null)" || return 0
+    home="$(getent passwd "${user}" | cut -d: -f6)"
+    [ -n "${home}" ] || return 0
+    unit="${home}/.config/systemd/user/${UNIT_NAME}.service"
+    [ -f "${unit}" ] || return 0
+    if sudo -u "${user}" XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+        systemctl --user disable --now "${UNIT_NAME}.service" >/dev/null 2>&1; then
+        echo "stopped the user service of ${user} that held the port"
+    fi
+    rm -f "${unit}"
+    rm -rf "${home}/.local/lib/megatron-sysmon"
+    echo "removed the earlier user-service installation of ${user}"
 }
 
 do_install_user() {
@@ -180,6 +208,8 @@ do_install() {
         return
     fi
     require_root
+    remove_previous_user_agent
+    cleanup_previous_agents
     install -d -m755 "${LIB_DIR}"
 
     # The Rust binary is the default: a static-feeling single file with a much

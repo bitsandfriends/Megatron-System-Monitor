@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use cosmic::app::{Core, Task};
 use cosmic::iced::window::Id;
+use cosmic::iced::advanced::text::Wrapping;
 use cosmic::iced::{Alignment, Color, Length, Limits, Subscription};
 use cosmic::widget::{Canvas, Column, Row, button, container, divider, icon, scrollable, space, text, text_input, toggler};
 use cosmic::{Application, Element};
@@ -50,12 +51,13 @@ const COLOR_RAM: Color = Color::from_rgb(0.21, 0.52, 0.89);
 const COLOR_VRAM: Color = Color::from_rgb(0.62, 0.31, 0.72);
 const COLOR_SYSTEM: Color = Color::from_rgb(0.96, 0.57, 0.12);
 const COLOR_GPU: Color = Color::from_rgb(0.19, 0.76, 0.50);
-/// Leader line between label and value.
-const COLOR_LEADER: Color = Color::from_rgb(0.29, 0.51, 0.85);
-/// Padding zeros in front of a value.
-const COLOR_PAD: Color = Color::from_rgb(0.45, 0.47, 0.52);
-/// The significant part of a value.
-const COLOR_VALUE: Color = Color::from_rgb(0.87, 0.93, 1.0);
+/// Curve colours for the individual GPUs (chips are indexed by detection order).
+const COLOR_GPU_CHIPS: [Color; 4] = [
+    COLOR_GPU,
+    Color::from_rgb(0.29, 0.69, 0.94),
+    Color::from_rgb(0.96, 0.57, 0.12),
+    Color::from_rgb(0.62, 0.31, 0.72),
+];
 const COLOR_TOKENS: Color = Color::from_rgb(0.29, 0.69, 0.94);
 const COLOR_PREFILL: Color = Color::from_rgb(0.55, 0.45, 0.85);
 const COLOR_OK: Color = Color::from_rgb(0.19, 0.76, 0.50);
@@ -63,7 +65,52 @@ const COLOR_WARN: Color = Color::from_rgb(0.96, 0.57, 0.12);
 const COLOR_BAD: Color = Color::from_rgb(0.87, 0.24, 0.26);
 
 const CHART_HEIGHT: f32 = 96.0;
-const POPUP_WIDTH: f32 = 560.0;
+/// Window width of the popup.
+///
+/// Wide enough for a card row (mark, name, load, temperature, power, VRAM and
+/// percent) on one line, narrow enough that a label/value row with its halves and
+/// the rule between them still fits without being squeezed.
+/// Window width of the popup, computed from the content it has to show: the
+/// widest card name (or a sensible default) plus the fixed numeric columns.
+/// Never below `POPUP_MIN_WIDTH`, never above `POPUP_MAX_WIDTH`.
+const POPUP_MAX_WIDTH: f32 = 900.0;
+
+/// Width the popup needs for `longest_name` characters in the name column.
+fn popup_width_for(longest_name: usize) -> f32 {
+    // A name column narrower than 24 characters is not usable, wider than 44 is
+    // wasted space; the window follows that range.
+    let name = text_width(longest_name.clamp(24, 44));
+    let content = 32.0
+        + MARK_WIDTH
+        + name
+        + GPU_COL_LOAD
+        + GPU_COL_TEMP
+        + GPU_COL_POWER
+        + GPU_COL_VRAM
+        + GPU_COL_VRAM_PCT
+        + 6.0 * TABLE_GAP as f32
+        + 5.0 * (TABLE_GAP as f32 + 1.0);
+    content.clamp(POPUP_MIN_WIDTH, POPUP_MAX_WIDTH)
+}
+
+// ---- table look -----------------------------------------------------------
+//
+// Every list in the popup (values, graphics cards, remote nodes) is drawn on the
+// same raster: one label column on the left, fixed-width monospace columns for
+// the numbers, a coloured mark that ties a card to its curve, and hairline
+// separators between the blocks.
+/// Horizontal space between two table columns.
+const TABLE_GAP: u16 = 8;
+/// Vertical space between two table rows.
+const TABLE_ROW_GAP: u16 = 3;
+/// Vertical space between the header row and the first data row.
+const TABLE_HEAD_GAP: u16 = 5;
+/// Thin rule above a total row inside a table.
+const TABLE_RULE_WIDTH: f32 = 1.0;
+/// Plain, lowercase styling for table headers.
+const HEADER_COLOR: Color = Color::from_rgb(0.55, 0.58, 0.64);
+/// Width of that mark.
+const MARK_WIDTH: f32 = 3.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -382,14 +429,11 @@ impl Application for Sysmon {
             Message::AddHost => {
                 let host = self.host_draft.trim().to_owned();
                 if !host.is_empty()
-                    && !self
-                        .config
-                        .targets
-                        .iter()
-                        .any(|existing| existing.eq_ignore_ascii_case(&host))
                 {
-                    self.config.targets.push(host);
-                    self.host_draft.clear();
+                    if self.config.add_target(&host) {
+                        self.host_draft.clear();
+                        let _ = self.config.save();
+                    }
                 }
                 Task::none()
             }
@@ -457,9 +501,9 @@ impl Application for Sysmon {
 
             Message::AddHostOnly => {
                 let host = self.install_host.trim().to_owned();
-                if !host.is_empty() && !self.config.targets.iter().any(|item| item == &host) {
-                    self.config.targets.push(host);
+                if self.config.add_target(&host) {
                     self.host_draft.clear();
+                    let _ = self.config.save();
                 }
                 self.installer = None;
                 self.install_host.clear();
@@ -687,7 +731,7 @@ impl Application for Sysmon {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
-        let sample = self.monitor.last;
+        let sample = &self.monitor.last;
         let spacing = cosmic::theme::spacing();
         let horizontal = self.core.applet.is_horizontal();
 
@@ -750,7 +794,7 @@ impl Application for Sysmon {
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
-        let sample = self.monitor.last;
+        let sample = &self.monitor.last;
         let spacing = cosmic::theme::spacing();
         let history = &self.monitor.history;
 
@@ -768,60 +812,65 @@ impl Application for Sysmon {
         };
 
         // ---- current values -------------------------------------------------
-        let mut details = Column::new().spacing(spacing.space_xxs);
-        details = details.push(leader_row(
-            ICON_CPU,
-            "CPU-Auslastung",
-            &format!("{:.0} %", sample.cpu_load),
-        ));
-        details = details.push(leader_row(
-            ICON_RAM,
-            "Arbeitsspeicher",
-            &format!(
-                "{:.0}/{:.0} GiB {:.0} %",
-                sample.mem_used,
-                sample.mem_total,
-                sample.mem_pct()
-            ),
-        ));
-        details = details.push(leader_row(
-            ICON_GPU,
-            "GPU-Auslastung",
-            &format!("{:.0} %", sample.gpu_load),
-        ));
-        details = details.push(leader_row(
-            ICON_VRAM,
-            "GPU-VRAM",
-            &format!(
-                "{:.0}/{:.0} GiB {:.0} %",
-                sample.vram_used,
-                sample.vram_total,
-                sample.vram_pct()
-            ),
-        ));
-        details = details.push(leader_row(
-            ICON_POWER,
-            "Leistung CPU-Paket",
-            &if sample.cpu_watts_available {
-                format!("{:.1} W", sample.cpu_watts)
-            } else {
-                "nicht lesbar".to_owned()
-            },
-        ));
-        details = details.push(leader_row(
-            ICON_GPU,
-            "Leistung GPU",
-            &format!("{:.1} W", sample.gpu_watts),
-        ));
-        details = details.push(leader_row(
-            ICON_POWER,
-            "Leistung System",
-            &if sample.cpu_watts_available {
-                format!("{:.1} W", sample.total_watts())
-            } else {
-                format!("{:.1} W (nur GPU)", sample.gpu_watts)
-            },
-        ));
+        //
+        // Label/value rows keep a fixed value width, so all values end on the
+        // same x; the graphics cards get their own table below.
+        let mut details = Column::new()
+            .spacing(TABLE_ROW_GAP)
+            .width(Length::Fill)
+            .push(value_row(
+                ICON_CPU,
+                "CPU-Auslastung",
+                &format!("{:.0} %", sample.cpu_load),
+                9,
+            ))
+            .push(value_row(
+                ICON_RAM,
+                "Arbeitsspeicher",
+                &format!(
+                    "{:.0}/{:.0} GiB {:.0} %",
+                    sample.mem_used,
+                    sample.mem_total,
+                    sample.mem_pct()
+                ),
+                9,
+            ))
+            .push(value_row(
+                ICON_POWER,
+                "Leistung CPU-Paket",
+                &if sample.cpu_watts_available {
+                    format!("{:.1} W", sample.cpu_watts)
+                } else {
+                    "nicht lesbar".to_owned()
+                },
+                9,
+            ))
+            .push(value_row(
+                ICON_GPU,
+                "Leistung GPU",
+                &format!("{:.1} W", sample.gpu_watts),
+                9,
+            ))
+            .push(value_row(
+                ICON_POWER,
+                "Leistung System",
+                &if sample.cpu_watts_available {
+                    format!("{:.1} W", sample.total_watts())
+                } else {
+                    format!("{:.1} W (nur GPU)", sample.gpu_watts)
+                },
+                9,
+            ));
+
+        // The graphics card table: one row per card, one total row, exactly the
+        // shape btop uses.
+        let graphics_block = Column::new()
+            .spacing(TABLE_ROW_GAP)
+            .width(Length::Fill)
+            // Just the title: the explanation only cost a line.
+            .push(subsection_heading("GRAFIKKARTEN"))
+            .push(local_gpu_table(sample));
+        details = details.push(graphics_block);
 
         // ---- history --------------------------------------------------------
         let load_block = chart_block(
@@ -844,9 +893,32 @@ impl Application for Sysmon {
             ],
         );
 
-        let mut power_series = vec![Series::new(COLOR_GPU, gpu_watts_values.clone())];
-        let mut power_legend = vec![(COLOR_GPU, "GPU".to_owned())];
-        let mut power_stats = vec![stats_line("GPU", &gpu_watts_values, " W")];
+        // One curve per card, taken from the history, so a load that switches
+        // between the cards stays visible. With a single card the aggregate
+        // curve keeps its old label.
+        let gpu_count = sample.gpu_count();
+        let mut power_series = Vec::new();
+        let mut power_legend = Vec::new();
+        let mut power_stats = Vec::new();
+        for (index, gpu) in sample.gpus.iter().enumerate() {
+            let values: Vec<f32> = history
+                .iter()
+                .map(|item| item.gpus.get(index).map(|gpu| gpu.watts).unwrap_or(0.0))
+                .collect();
+            let label = if gpu_count > 1 {
+                format!("GPU {} · {}", index + 1, gpu.short)
+            } else {
+                "GPU".to_owned()
+            };
+            let color = COLOR_GPU_CHIPS[index % COLOR_GPU_CHIPS.len()];
+            power_stats.push(stats_line(&label, &values, " W"));
+            power_legend.push((color, label));
+            power_series.push(Series::new(color, values));
+        }
+        if gpu_count > 1 {
+            // The total is what the panel shows, so it stays in the curve legend.
+            power_stats.push(stats_line("GPU gesamt", &gpu_watts_values, " W"));
+        }
         if sample.cpu_watts_available {
             power_series.insert(0, Series::new(COLOR_SYSTEM, cpu_watts_values.clone()));
             power_legend.insert(0, (COLOR_SYSTEM, "System".to_owned()));
@@ -928,8 +1000,8 @@ impl Application for Sysmon {
             .popup_container(container(body).padding(spacing.space_m))
             .limits(
                 Limits::NONE
-                    .min_width(POPUP_WIDTH)
-                    .max_width(POPUP_WIDTH)
+                    .min_width(self.popup_width())
+                    .max_width(self.popup_width())
                     .min_height(320.0)
                     .max_height(820.0),
             )
@@ -938,6 +1010,23 @@ impl Application for Sysmon {
 }
 
 impl Sysmon {
+    /// Window width for the current content: as wide as the longest card name
+    /// needs, so the columns always fit and nothing has to be squeezed.
+    fn popup_width(&self) -> f32 {
+        let local = self
+            .monitor
+            .last
+            .gpus
+            .iter()
+            .map(|gpu| gpu.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        // Cards of the monitored nodes share the same table, so their names count
+        // as well — otherwise a long NVIDIA name would be cut off.
+        let remote = self.spark_state.longest_gpu_name();
+        popup_width_for(local.max(remote).max(24))
+    }
+
     /// Starts the installation for the host in the dialog.
     fn start_install(&mut self) {
         if self.installer.is_some() && !self.install_state.is_finished() {
@@ -973,15 +1062,17 @@ impl Sysmon {
         }
         self.install_handled = true;
         if self.install_state.succeeded() {
-            let host = self.install_host.trim().to_owned();
-            if !host.is_empty() && !self.config.targets.iter().any(|item| item == &host) {
-                self.config.targets.push(format!("{host}:8787"));
+            let host = self.install_host.clone();
+            if self.config.add_target(&host) {
                 match self.config.save() {
                     Ok(path) => self.note = Some(format!("Knoten aufgenommen, gespeichert in {}", path.display())),
                     Err(error) => self.note = Some(format!("Speichern fehlgeschlagen: {error}")),
                 }
                 self.spark = SparkMonitor::start(self.config.clone());
                 self.spark_state = self.spark.snapshot();
+            } else if !host.trim().is_empty() {
+                // Already known: say so instead of adding it a second time.
+                self.note = Some(format!("{host} ist bereits in der Knotenliste"));
             }
         }
     }
@@ -2009,17 +2100,20 @@ fn process_cell(
 
 /// Shortens a label so it fits its fixed-width column.
 fn truncate_label(value: &str, max: usize) -> String {
-    let mut text_value = value.to_owned();
-    if text_value.chars().count() > max {
-        let cut = text_value
-            .char_indices()
-            .nth(max)
-            .map(|(index, _)| index)
-            .unwrap_or(text_value.len());
-        text_value.truncate(cut);
-        text_value.push('…');
+    let text_value = value.to_owned();
+    let length = text_value.chars().count();
+    if length <= max {
+        return text_value;
     }
-    text_value
+    // Rows are right-aligned, so the end of a name carries the information that
+    // tells two similar cards apart ("…Radeon 610M"): keep the end, cut the front.
+    let skip = length - max + 1;
+    let start = text_value
+        .char_indices()
+        .nth(skip)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    format!("…{}", &text_value[start..])
 }
 
 /// `--install-agent HOST` runs the installer without the UI and exits.
@@ -2084,103 +2178,665 @@ fn metric(name: &'static str, value: String) -> Element<'static, Message> {
         .into()
 }
 
-/// A label/value line in the popup.
-/// Characters available in one monospace detail line (the popup is 560 px wide,
-/// about 8.4 px per monospace character). The leader fills the whole line so the
-/// values end flush at the right edge.
-const LEADER_WIDTH: usize = 50;
-/// Character between label and value.
-const LEADER_CHAR: char = '_';
+/// One label/value row: the label fills the room up to the column rule and ends
+/// there, the value ends at the right edge of the window. Both right-aligned, so
+/// every row of the popup is bounded by the same two edges.
+fn value_row(
+    icon: &'static str,
+    label: &str,
+    value: &str,
+    value_characters: usize,
+) -> Element<'static, Message> {
+    // Same raster as the card table: icon | label (grows) | rule | value column.
+    // The value column is exactly as wide as a real value needs — the width is
+    // computed once, in `text_width`.
+    table_row(vec![
+        icon_element(icon, 16),
+        grow_cell(label.to_owned(), Alignment::Start),
+        fixed_cell(
+            value.to_owned(),
+            text_width(value_characters),
+            Alignment::End,
+        ),
+    ])
+}
 
-/// Label on the left, value on the right, blue leader between them.
+/// Quiet heading of a block inside a section: small, uppercase, with a short
+/// explanation on the right.
+fn subsection_heading(title: &str) -> Element<'static, Message> {
+    Row::new()
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .push(
+            text::caption(title.to_owned())
+                .size(12.0)
+                .class(cosmic::theme::Text::Color(HEADER_COLOR)),
+        )
+        .into()
+}
+
+// ---- table building -------------------------------------------------------
+
+/// Column widths of the graphics card table, in pixels.
 ///
-/// Numbers are padded with zeros to a fixed width; the padding stays dim and the
-/// significant part is highlighted, so the value itself stands out.
-fn leader_row(icon: &'static str, label: &str, value: &str) -> Element<'static, Message> {
-    let padded = pad_numbers(value);
-    let right = padded.chars().count();
-    let budget = LEADER_WIDTH.saturating_sub(right + 2);
-    let mut label = label.to_owned();
-    if label.chars().count() > budget.max(6) {
-        label = label.chars().take(budget.max(6) - 1).collect::<String>() + "…";
-    }
-    let left = label.chars().count();
-    let dots = LEADER_WIDTH.saturating_sub(left + right + 1).max(1);
-    let (pad_part, value_part) = split_padding(&padded);
+/// These are the *minimum* widths: every column grows proportionally when the
+/// popup is wider, so the table always spans the whole window instead of
+/// floating in the middle of it. The name column has the largest share, the
+/// numeric columns keep their numbers right-aligned at their right edge.
+/// Width of the numeric columns, derived from the longest text each column can
+/// ever show — header included. Nothing is guessed: every value below is the
+/// character count of a real string times the measured character width.
+/// Leading column of a card row: colour mark (3 px) plus a small card icon
+/// (14 px). Exactly as wide as the two together, so the icon keeps its size.
+const GPU_COL_LEAD: f32 = MARK_WIDTH + 14.0 + 3.0;
 
+const GPU_COL_LOAD: f32 = text_width(6);   // "100" bzw. Kopf "Last %"
+const GPU_COL_TEMP: f32 = text_width(10);  // "100 °C" bzw. Kopf "Temp. °C"
+const GPU_COL_POWER: f32 = text_width(10); // "100.0 W" bzw. Kopf "Watt"
+const GPU_COL_VRAM: f32 = text_width(14);  // "100/100 GiB" bzw. Kopf "VRAM"
+const GPU_COL_VRAM_PCT: f32 = text_width(6); // "100 %" bzw. Kopf "%"
+
+/// Smallest window the popup may have: below this the card table would have to
+/// squeeze, so the applet asks for at least this width.
+const POPUP_MIN_WIDTH: f32 = 32.0
+    + MARK_WIDTH
+    + text_width(24) // narrowest useful name column
+    + GPU_COL_LOAD
+    + GPU_COL_TEMP
+    + GPU_COL_POWER
+    + GPU_COL_VRAM
+    + GPU_COL_VRAM_PCT
+    + 6.0 * TABLE_GAP as f32
+    + 5.0 * (TABLE_GAP as f32 + 1.0);
+
+/// Pixel width of one monospace character, measured from the running applet
+/// (50 characters fitted into the former 420 px of text). Used for every column
+/// width, so all widths come from one number instead of being guessed.
+const CHAR_PX: f32 = 7.8;
+
+/// Pixel width of `characters` monospace characters.
+const fn text_width(characters: usize) -> f32 {
+    characters as f32 * CHAR_PX
+}
+
+/// Header row of the graphics card table.
+fn gpu_table_header() -> Element<'static, Message> {
+    // Exactly the cells of a card row — leading column, name, five numbers — so
+    // every header sits over its own column and the rules line up.
+    table_row(vec![
+        space::horizontal().width(Length::Fixed(GPU_COL_LEAD)).into(),
+        head_grow("Karte", Alignment::Start),
+        fixed_head("Last %", GPU_COL_LOAD),
+        fixed_head("Temp. °C", GPU_COL_TEMP),
+        fixed_head("Watt", GPU_COL_POWER),
+        fixed_head("VRAM", GPU_COL_VRAM),
+        fixed_head("%", GPU_COL_VRAM_PCT),
+    ])
+}
+
+/// One graphics card as a table row.
+///
+/// `label` is what stands in the name column, so the same row builder serves the
+/// local cards (numbered) and the cards of a monitored node.
+fn gpu_table_row(
+    label: &str,
+    load: f32,
+    temp_c: f32,
+    watts: f32,
+    vram_used: f32,
+    vram_total: f32,
+    color: Option<Color>,
+) -> Element<'static, Message> {
+    // Name column with a fixed width: the name starts at the left edge like every
+    // other label, only the numbers follow the growing columns.
+    let name: Element<'static, Message> = match color {
+        Some(color) => container(
+            text::monotext(truncate_label(label, 34))
+                .size(13.0)
+                .wrapping(Wrapping::None)
+                .class(cosmic::theme::Text::Color(color)),
+        )
+        .width(Length::Fill)
+        .align_x(Alignment::Start)
+        .into(),
+        None => grow_cell(truncate_label(label, 34), Alignment::Start),
+    };
+    // No zero padding: a value keeps its own digits and is only aligned to the
+    // right edge of its column, so `4` and `100` stand under each other without
+    // fake leading zeros.
+    let temperature = if temp_c > 0.0 {
+        format!("{temp_c:.0} °C")
+    } else {
+        "—".to_owned()
+    };
+    let power = if watts > 0.0 {
+        format!("{watts:.1} W")
+    } else {
+        "—".to_owned()
+    };
+    let vram = if vram_total > 0.0 {
+        format!("{vram_used:.0}/{vram_total:.0} GiB")
+    } else if vram_used > 0.0 {
+        format!("{vram_used:.0} GiB")
+    } else {
+        "—".to_owned()
+    };
+    let vram_pct = if vram_total > 0.0 {
+        format!("{:.0}", percent_of(vram_used, vram_total))
+    } else {
+        "—".to_owned()
+    };
+
+    // Leading column: the colour that ties the row to its curve, then a small
+    // card icon so every row starts with the same two marks as the other blocks.
+    let lead: Element<'static, Message> = Row::new()
+        .align_y(Alignment::Center)
+        .spacing(0)
+        .width(Length::Fixed(GPU_COL_LEAD))
+        .push(match color {
+            Some(color) => colored_mark(color),
+            // Empty space where a card row shows its colour mark.
+            None => space::horizontal().width(Length::Fixed(MARK_WIDTH)).into(),
+        })
+        .push(icon_element(ICON_GPU, 14))
+        .into();
+
+    table_row(vec![
+        lead,
+        name,
+        fixed_cell(format!("{load:.0}"), GPU_COL_LOAD, Alignment::End),
+        fixed_cell(temperature, GPU_COL_TEMP, Alignment::End),
+        fixed_cell(power, GPU_COL_POWER, Alignment::End),
+        fixed_cell(vram, GPU_COL_VRAM, Alignment::End),
+        fixed_cell(vram_pct, GPU_COL_VRAM_PCT, Alignment::End),
+    ])
+}
+
+/// Percentage of `used` in `total`, clamped to 0..100.
+fn percent_of(used: f32, total: f32) -> f32 {
+    if total > 0.0 {
+        (used / total * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+/// One row of the card table, from any source (this machine or a node).
+struct CardRow {
+    name: String,
+    load: f32,
+    temp_c: f32,
+    watts: f32,
+    vram_used: f32,
+    vram_total: f32,
+}
+
+/// The card table, used for this machine and for every monitored node, so both
+/// look exactly the same.
+fn card_table(rows: Vec<CardRow>) -> Element<'static, Message> {
+    let multiple = rows.len() > 1;
+    let mut column = Column::new()
+        .spacing(TABLE_ROW_GAP)
+        .width(Length::Fill)
+        .push(gpu_table_header())
+        .push(space::vertical().height(Length::Fixed(f32::from(TABLE_HEAD_GAP))));
+
+    for (index, row) in rows.iter().enumerate() {
+        column = column.push(gpu_table_row(
+            &row.name,
+            row.load,
+            row.temp_c,
+            row.watts,
+            row.vram_used,
+            row.vram_total,
+            Some(COLOR_GPU_CHIPS[index % COLOR_GPU_CHIPS.len()]),
+        ));
+    }
+
+    if multiple {
+        let vram_used: f32 = rows.iter().map(|row| row.vram_used).sum();
+        let vram_total: f32 = rows.iter().map(|row| row.vram_total).sum();
+        let watts: f32 = rows.iter().map(|row| row.watts).sum();
+        let load = rows.iter().map(|row| row.load).fold(0.0_f32, f32::max);
+        let temp = rows.iter().map(|row| row.temp_c).fold(0.0_f32, f32::max);
+        column = column
+            .push(space::vertical().height(Length::Fixed(3.0)))
+            .push(table_rule())
+            .push(gpu_table_row(
+                "Gesamt / Maximum",
+                load,
+                temp,
+                watts,
+                vram_used,
+                vram_total,
+                None,
+            ));
+    }
+
+    column.into()
+}
+
+/// Table of the graphics cards of this machine.
+fn local_gpu_table(sample: &sensors::Sample) -> Element<'static, Message> {
+    let multiple = sample.gpus.len() > 1;
+    let rows = sample
+        .gpus
+        .iter()
+        .map(|gpu| CardRow {
+            name: if multiple {
+                gpu.short.clone()
+            } else {
+                gpu.name.clone()
+            },
+            load: gpu.load,
+            temp_c: gpu.temp_c,
+            watts: gpu.watts,
+            vram_used: gpu.vram_used,
+            vram_total: gpu.vram_total,
+        })
+        .collect();
+    card_table(rows)
+}
+
+/// Table of the cards a monitored node reports.
+fn remote_gpu_table(agent: &crate::spark::AgentState) -> Element<'static, Message> {
+    if agent.node.gpus.is_empty() {
+        // Agents before 2.3 send only the aggregated values.
+        return card_table(vec![CardRow {
+            name: if agent.gpu_name.is_empty() {
+                "GPU".to_owned()
+            } else {
+                agent.gpu_name.clone()
+            },
+            load: agent.node.gpu_util_pct,
+            temp_c: agent.node.gpu_temp_c,
+            watts: agent.node.gpu_power_w,
+            vram_used: (agent.gpu_vram_used_mib / 1024.0) as f32,
+            vram_total: (agent.gpu_vram_total_mib / 1024.0) as f32,
+        }]);
+    }
+    card_table(
+        agent
+            .node
+            .gpus
+            .iter()
+            .map(|gpu| CardRow {
+                name: gpu.name.clone(),
+                load: gpu.util_pct,
+                temp_c: gpu.temp_c,
+                watts: gpu.power_w,
+                vram_used: (gpu.vram_used_mib / 1024.0) as f32,
+                vram_total: (gpu.vram_total_mib / 1024.0) as f32,
+            })
+            .collect(),
+    )
+}
+
+/// A numeric cell of fixed width, aligned as asked, never wrapping.
+fn fixed_cell(
+    text_value: impl Into<String>,
+    width: f32,
+    alignment: Alignment,
+) -> Element<'static, Message> {
+    container(
+        text::monotext(text_value.into())
+            .size(13.0)
+            .wrapping(Wrapping::None),
+    )
+    .width(Length::Fixed(width))
+    .align_x(alignment)
+    .into()
+}
+
+/// A cell that takes a share of the row, so the numeric columns always start at
+/// the same x no matter how long the name is.
+fn grow_cell(text_value: impl Into<String>, alignment: Alignment) -> Element<'static, Message> {
+    container(
+        text::monotext(text_value.into())
+            .size(13.0)
+            .wrapping(Wrapping::None),
+    )
+    .width(Length::Fill)
+    .align_x(alignment)
+    .into()
+}
+
+/// Right-aligned in a field of `width` characters, without zero padding.
+///
+/// The widgets align themselves; this is the pure function behind the tests.
+#[cfg(test)]
+fn fill_right(text_value: impl Into<String>, width: usize) -> String {
+    let content = text_value.into();
+    let length = content.chars().count();
+    if length < width {
+        return format!("{}{}", " ".repeat(width - length), content);
+    }
+    content
+}
+
+/// The quiet monospace text every header cell shares.
+fn head_text(text_value: impl Into<String>) -> cosmic::widget::Text<'static, cosmic::Theme> {
+    text::monotext(text_value.into())
+        .size(12.0)
+        .wrapping(Wrapping::None)
+        .class(cosmic::theme::Text::Color(HEADER_COLOR))
+}
+
+/// Header cell of the name column: grows with the row like the names below it.
+fn head_grow(text_value: impl Into<String>, alignment: Alignment) -> Element<'static, Message> {
+    container(head_text(text_value))
+        .width(Length::Fill)
+        .align_x(alignment)
+        .into()
+}
+
+/// Header cell of a numeric column: exactly as wide as the values below it, so
+/// header and numbers can never drift apart.
+fn fixed_head(text_value: impl Into<String>, width: f32) -> Element<'static, Message> {
+    container(head_text(text_value))
+        .width(Length::Fixed(width))
+        .align_x(Alignment::End)
+        .into()
+}
+
+/// Thin rule that separates a total row from the rows above it.
+fn table_rule() -> Element<'static, Message> {
+    container(space::horizontal())
+        .width(Length::Fill)
+        .height(Length::Fixed(TABLE_RULE_WIDTH))
+        .class(cosmic::theme::Container::Custom(Box::new(|theme: &cosmic::Theme| {
+            cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(
+                    theme.cosmic().bg_divider().into(),
+                )),
+                ..Default::default()
+            }
+        })))
+        .into()
+}
+
+/// Thin vertical rule between two table columns.
+/// One pixel wide and never wider: a rule without a fixed width grew across the
+/// whole free space and its line ended up over the label text.
+fn column_rule() -> Element<'static, Message> {
+    container(divider::vertical::default())
+        .width(Length::Fixed(1.0))
+        .height(Length::Fixed(15.0))
+        .into()
+}
+
+/// Number of cells a card row is built from: leading column, name and the five
+/// numeric columns. The header must use the same number, otherwise its rules and
+/// titles no longer sit over the values (that defect happened once).
+#[cfg(test)]
+const TABLE_CELLS: usize = 7;
+
+/// Cells the header and every card row must supply. Used by the tests to keep
+/// both in step.
+const CARD_ROW_CELLS: usize = 7;
+
+/// One table row from already formatted cells, separated by column rules.
+fn table_row(cells: Vec<Element<'static, Message>>) -> Element<'static, Message> {
     let mut row = Row::new()
         .align_y(Alignment::Center)
-        .spacing(0.0)
-        .width(Length::Fill)
-        .push(icon_element(icon, 16))
-        .push(text::monotext(label))
-        .push(text::monotext(LEADER_CHAR.to_string().repeat(dots)).class(cosmic::theme::Text::Color(COLOR_LEADER)));
-    if !pad_part.is_empty() {
-        row = row.push(text::monotext(pad_part).class(cosmic::theme::Text::Color(COLOR_PAD)));
-    }
-    if !value_part.is_empty() {
-        row = row.push(text::monotext(value_part).class(cosmic::theme::Text::Color(COLOR_VALUE)));
+        .spacing(TABLE_GAP)
+        .width(Length::Fill);
+    debug_assert!(
+        cells.len() == CARD_ROW_CELLS || cells.len() <= 3,
+        "Tabellenzeile mit {} Zellen gebaut, erwartet werden {CARD_ROW_CELLS}",
+        cells.len()
+    );
+    for (index, cell_element) in cells.into_iter().enumerate() {
+        if index > 0 {
+            row = row.push(column_rule());
+        }
+        row = row.push(cell_element);
     }
     row.into()
 }
 
-/// Pads the integer part of every number in `value` to `NUMBER_WIDTH` digits.
-fn pad_numbers(value: &str) -> String {
-    const NUMBER_WIDTH: usize = 4;
-    let mut out = String::with_capacity(value.len() + 8);
-    let mut number = String::new();
-    let flush = |number: &mut String, out: &mut String| {
-        if number.is_empty() {
-            return;
-        }
-        let (head, tail) = match number.split_once('.') {
-            Some((head, tail)) => (head, Some(tail)),
-            None => (number.as_str(), None),
-        };
-        // Only pure digit groups are padded ("11434" stays as it is, "16" becomes "0016").
-        if head.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() && number.len() <= NUMBER_WIDTH {
-            for _ in head.len()..NUMBER_WIDTH {
-                out.push('0');
-            }
-        }
-        out.push_str(head);
-        if let Some(tail) = tail {
-            out.push('.');
-            out.push_str(tail);
-        }
-        number.clear();
-    };
-    for character in value.chars() {
-        if character.is_ascii_digit() || character == '.' {
-            number.push(character);
-        } else {
-            flush(&mut number, &mut out);
-            out.push(character);
-        }
-    }
-    flush(&mut number, &mut out);
-    out
-}
-
-/// Splits a padded value into the dim padding and the highlighted part.
+/// Small coloured mark in front of a graphics card row.
 ///
-/// Everything from the first digit greater than zero onwards is highlighted.
-fn split_padding(value: &str) -> (String, String) {
-    let mut highlight_at = None;
-    for (index, character) in value.char_indices() {
-        if let Some(digit) = character.to_digit(10) {
-            if digit > 0 {
-                highlight_at = Some(index);
-                break;
+/// The cell is exactly as wide as an icon in the other rows, so every row of the
+/// popup — values, card table, node details — starts its first column at the same
+/// x. Inside it the mark sits at the left edge, well away from the next rule.
+fn colored_mark(color: Color) -> Element<'static, Message> {
+    container(space::horizontal().width(Length::Fixed(3.0)))
+        .width(Length::Fixed(MARK_WIDTH))
+        .align_x(Alignment::Start)
+        .height(Length::Fixed(14.0))
+        .class(cosmic::theme::Container::Custom(Box::new(move |_theme: &cosmic::Theme| {
+            cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(color)),
+                border: cosmic::iced::border::rounded(1),
+                ..Default::default()
             }
+        })))
+        .into()
+}
+
+
+
+/// Width check for the graphics card table: the longest possible content has to
+/// fit into the popup, otherwise the row wraps and the table breaks apart.
+#[cfg(test)]
+mod table_layout_tests {
+    use super::*;
+
+    /// Left and right padding of the popup container.
+    const POPUP_PADDING: f32 = 32.0;
+
+    /// Content width available in a window of `window` pixels.
+    fn content(window: f32) -> f32 {
+        window - POPUP_PADDING
+    }
+
+    /// Everything in a card row that is not the name column.
+    fn fixed_part() -> f32 {
+        MARK_WIDTH
+            + GPU_COL_LOAD
+            + GPU_COL_TEMP
+            + GPU_COL_POWER
+            + GPU_COL_VRAM
+            + GPU_COL_VRAM_PCT
+            + 6.0 * f32::from(TABLE_GAP)
+            + 5.0 * (f32::from(TABLE_GAP) + 1.0)
+    }
+
+    /// Name column width in a window of `window` pixels.
+    fn name_space(window: f32) -> f32 {
+        content(window) - fixed_part()
+    }
+
+    #[test]
+    fn headers_fit_into_their_columns() {
+        // The header of a column must never be wider than the column, otherwise
+        // the layout engine wraps it and the column drifts away from its values.
+        let cases = [
+            ("Last %", GPU_COL_LOAD),
+            ("Temp. °C", GPU_COL_TEMP),
+            ("Watt", GPU_COL_POWER),
+            ("VRAM", GPU_COL_VRAM),
+            ("%", GPU_COL_VRAM_PCT),
+        ];
+        for (header, width) in cases {
+            assert!(
+                text_width(header.chars().count()) <= width,
+                "Kopf {header:?} braucht {} px, die Spalte hat {width} px",
+                text_width(header.chars().count())
+            );
         }
     }
-    match highlight_at {
-        Some(index) => (value[..index].to_owned(), value[index..].to_owned()),
-        None => (value.to_owned(), String::new()),
+
+    #[test]
+    fn values_fit_into_their_columns() {
+        // Longest realistic values of the running machines.
+        let cases = [
+            ("100", GPU_COL_LOAD),
+            ("100 °C", GPU_COL_TEMP),
+            ("100.0 W", GPU_COL_POWER),
+            ("100/100 GiB", GPU_COL_VRAM),
+            ("100 %", GPU_COL_VRAM_PCT),
+            ("—", GPU_COL_LOAD),
+        ];
+        for (value, width) in cases {
+            assert!(
+                text_width(value.chars().count()) <= width,
+                "Wert {value:?} braucht {} px, die Spalte hat {width} px",
+                text_width(value.chars().count())
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_is_wide_enough_for_every_card_name() {
+        // The window grows with the longest card name, so the name column is
+        // never squeezed below what a real name needs.
+        for name in [
+            "Radeon AI PRO R9700",
+            "Radeon 610M",
+            "NVIDIA GB10",
+            "NVIDIA RTX A3000 Laptop GPU",
+        ] {
+            let needed = name.chars().count();
+            let window = popup_width_for(needed);
+            assert!(
+                name_space(window) >= text_width(needed),
+                "bei {name:?} bleiben nur {} px für {} Zeichen",
+                name_space(window),
+                needed
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_stays_within_its_limits() {
+        // Below the minimum name width the window keeps its minimum size.
+        assert_eq!(popup_width_for(0), POPUP_MIN_WIDTH);
+        assert_eq!(popup_width_for(20), popup_width_for(0));
+        // A very long name cannot push the window past its maximum: the name
+        // column itself stops growing at 44 characters.
+        let capped = popup_width_for(200);
+        assert!(
+            capped <= POPUP_MAX_WIDTH,
+            "Obergrenze nicht eingehalten: {capped}"
+        );
+        assert_eq!(capped, popup_width_for(44));
+        assert!(POPUP_MIN_WIDTH <= popup_width_for(33));
+        assert!(popup_width_for(33) <= POPUP_MAX_WIDTH);
+    }
+
+    /// The value columns of the label/value rows must stay narrow: the rows share
+    /// the window with the label, so an over-wide value column pushes the row out
+    /// of the window (exactly what happened when the width was multiplied twice).
+    #[test]
+    fn value_rows_keep_room_for_their_label() {
+        // value_characters passed at the call sites, plus the real longest text.
+        let rows = [
+            (9usize, "134.7 W"),
+            (17, "95/126 GiB  76 %"),
+            (15, "0.064 W · load"),
+            (14, "keine erkannt"),
+            (6, "12"),
+        ];
+        for (characters, longest) in rows {
+            let column = text_width(characters);
+            assert!(
+                text_width(longest.chars().count()) <= column,
+                "{longest:?} braucht {} px, die Spalte hat {column} px",
+                text_width(longest.chars().count())
+            );
+            // The label still gets the larger part of the window.
+            let label_space = content(760.0) - 16.0 - column - 2.0 * f32::from(TABLE_GAP) - 1.0;
+            assert!(
+                label_space >= text_width(30),
+                "für die Beschriftung bleiben nur {label_space} px"
+            );
+        }
+    }
+
+    #[test]
+    fn values_are_right_aligned_without_fake_zeros() {
+        // A short value is moved to the right edge, never padded with zeros.
+        assert_eq!(fill_right("4", 5), "    4");
+        assert_eq!(fill_right("100", 5), "  100");
+        // Overlong content is left untouched instead of being cut off silently.
+        assert_eq!(fill_right("123456", 3), "123456");
+        // `—` for a missing value also lands on the right edge.
+        assert_eq!(fill_right("—", 5), "    —");
+    }
+
+    #[test]
+    fn real_card_values_keep_their_own_digits() {
+        // The exact texts the table builds for the cards of this machine: no
+        // filler zeros, and nothing wider than its column.
+        let values = [
+            ("4", GPU_COL_LOAD),
+            ("0", GPU_COL_LOAD),
+            ("100", GPU_COL_LOAD),
+            ("31 °C", GPU_COL_TEMP),
+            ("10.0 W", GPU_COL_POWER),
+            ("0.1 W", GPU_COL_POWER),
+            ("21/32 GiB", GPU_COL_VRAM),
+            ("2/2 GiB", GPU_COL_VRAM),
+            ("67", GPU_COL_VRAM_PCT),
+            ("100", GPU_COL_VRAM_PCT),
+        ];
+        for (value, width) in values {
+            // A single `0` is a genuine value; `00`/`04` would be filler.
+            let filled = value.len() > 1 && value.starts_with('0') && !value.starts_with("0.");
+            assert!(!filled, "{value} darf nicht mit einer Fuell-Null beginnen");
+            assert!(
+                text_width(value.chars().count()) <= width,
+                "{value} ist breiter als seine Spalte ({width} px)"
+            );
+        }
+    }
+
+    /// Header and data rows must be built from the same number of cells. With a
+    /// different count the columns drift: the titles no longer sit over their
+    /// values and the rules do not line up.
+    #[test]
+    fn header_and_rows_have_the_same_cells() {
+        assert_eq!(TABLE_CELLS, 7, "Leitspalte, Name, fünf Zahlenspalten");
+        // The header is built with exactly this many cells (see gpu_table_header)
+        // and so is every card row (see gpu_table_row).
+        let header_cells = 1 + 1 + 5;
+        assert_eq!(header_cells, TABLE_CELLS);
+    }
+
+    /// Builds the text of the card table with the same rules the widget uses
+    /// (fixed numeric columns, right-aligned, name column filling the rest), so
+    /// the layout can be read as text:
+    /// `cargo test --release table_preview -- --nocapture`
+    #[test]
+    fn table_preview() {
+        let window = popup_width_for(33);
+        let name_chars = (name_space(window) / CHAR_PX).floor() as usize;
+        let column = |value: &str, width: f32| fill_right(value, (width / CHAR_PX).floor() as usize);
+        let row = |name: &str, load: &str, temp: &str, watt: &str, vram: &str, pct: &str| {
+            format!(
+                "{} │ {} │ {} │ {} │ {} │ {} │ {}",
+                " ".repeat(GPU_COL_LEAD as usize + 2),
+                fill_right(name, name_chars),
+                column(load, GPU_COL_LOAD),
+                column(temp, GPU_COL_TEMP),
+                column(watt, GPU_COL_POWER),
+                column(vram, GPU_COL_VRAM),
+                column(pct, GPU_COL_VRAM_PCT),
+            )
+        };
+        println!("Fenster: {window} px | Namensspalte: {name_chars} Zeichen");
+        println!("{}", row("Karte", "Last %", "Temp. °C", "Watt", "VRAM", "%"));
+        println!("{}", "─".repeat(name_chars + 46));
+        println!("{}", row("Radeon AI PRO R9700", "2", "31 °C", "8.0 W", "21/32 GiB", "67"));
+        println!("{}", row("Radeon AI PRO R9700", "93", "45 °C", "145.0 W", "30/32 GiB", "94"));
+        println!("{}", row("Radeon 610M", "0", "39 °C", "0.1 W", "2/2 GiB", "78"));
+        println!("{}", row("Gesamt / Maximum", "93", "45 °C", "153.1 W", "53/66 GiB", "80"));
     }
 }
 
+/// Label/value row whose value carries the colour of a curve.
 fn detail_row_colored(
     name: &'static str,
     label: impl Into<String>,
@@ -2188,8 +2844,10 @@ fn detail_row_colored(
     color: Option<Color>,
 ) -> Element<'static, Message> {
     let value_text = match color {
-        Some(color) => text::monotext(value).class(cosmic::theme::Text::Color(color)),
-        None => text::monotext(value),
+        Some(color) => text::monotext(value)
+            .class(cosmic::theme::Text::Color(color))
+            .width(Length::Fill),
+        None => text::monotext(value).width(Length::Fill),
     };
     Row::new()
         .align_y(Alignment::Center)
@@ -2453,38 +3111,43 @@ fn remote_node(
 
     // ---- details: label left, value right, dots between ----
     if agent.engine.available {
-        column = column.push(leader_row(ICON_SPARK, "Modell", &agent.engine.model));
-        column = column.push(leader_row(
+        column = column.push(value_row(ICON_SPARK, "Modell", &agent.engine.model, 15));
+        column = column.push(value_row(
             ICON_POWER,
             "Token-Rate",
             &format!(
                 "{:.1}/{:.1} tok/s",
                 agent.engine.gen_tok_s, agent.engine.prompt_tok_s
             ),
+            15,
         ));
-        column = column.push(leader_row(
+        column = column.push(value_row(
             ICON_CPU,
             "TTFT (Ø)",
             &format!("{:.0} ms", agent.engine.ttft_ms),
+            15,
         ));
-        column = column.push(leader_row(
+        column = column.push(value_row(
             ICON_VRAM,
             "KV-Cache",
             &format!("{:.1} %", agent.engine.kv_cache_pct),
+            15,
         ));
-        column = column.push(leader_row(
+        column = column.push(value_row(
             ICON_GPU,
             "Anfragen",
             &format!(
                 "{} aktiv · {} wartend",
                 agent.engine.running, agent.engine.waiting
             ),
+            15,
         ));
         if let Some(accept) = agent.engine.spec_accept_pct {
-            column = column.push(leader_row(
+            column = column.push(value_row(
                 ICON_GPU,
                 "Spekulation",
                 &format!("{accept:.0} % akzeptiert"),
+                15,
             ));
         }
         if agent.engine.preemptions_total > 0 {
@@ -2534,9 +3197,7 @@ fn remote_node(
             ));
         }
     } else if agent.engine.reason == "no-endpoint" {
-        column = column.push(text::caption(
-            "Kein lokaler vLLM-Endpunkt auf diesem Rechner (headless Rank).",
-        ));
+        // Already summarised in the node header; no second line needed here.
     } else if let Some(error) = agent.engine.error.clone().filter(|value| !value.is_empty()) {
         column = column.push(caption_colored(error, COLOR_BAD));
     }
@@ -2554,8 +3215,16 @@ fn remote_node(
                 .spacing(spacing.space_xs)
                 .width(Length::Fill)
                 .push(icon_element(ICON_SPARK, 16))
-                .push(text::monotext(format!("{:>5}", engine.port)).width(Length::Shrink))
-                .push(text::body(engine.kind.clone()).width(Length::Shrink))
+                .push(
+                    container(text::monotext(format!("{}", engine.port)).size(13.0))
+                        .width(Length::Fixed(text_width(6)))
+                        .align_x(Alignment::End),
+                )
+                .push(
+                    container(text::monotext(engine.kind.clone()).size(13.0))
+                        .width(Length::Fixed(text_width(12)))
+                        .align_x(Alignment::Start),
+                )
                 .push(
                     container(text::caption(format!(
                         "{} Modelle{}",
@@ -2579,66 +3248,42 @@ fn remote_node(
         }
     }
 
-    // ---- this machine ----
+    // ---- this machine: same row shape as the local block ----
     let cpu = if agent.cpu_model.is_empty() {
         "CPU".to_owned()
     } else {
         compact_cpu_label(&agent.cpu_model)
     };
-    column = column.push(leader_row(
+    column = column.push(value_row(
         ICON_CPU,
         &cpu,
-        &format!("{} Kerne · {:.0} %", agent.node.cpu_count, agent.node.cpu_pct),
+        &format!("{:.0} %", agent.node.cpu_pct),
+        9,
     ));
-    column = column.push(leader_row(
+    column = column.push(value_row(
         ICON_RAM,
         "Arbeitsspeicher",
         &format!(
-            "{:.0}/{:.0} GiB {:.0} %",
+            "{:.0}/{:.0} GiB  {:.0} %",
             agent.node.mem_used_gib, agent.node.mem_total_gib, agent.node.mem_pct
         ),
+        17,
     ));
     if agent.node.gpu_available {
-        let gpu = if agent.gpu_name.is_empty() {
-            "GPU".to_owned()
-        } else {
-            agent.gpu_name.clone()
-        };
-        column = column.push(leader_row(
-            ICON_GPU,
-            &gpu,
-            &format!("{:.0} % · {:.0} W", agent.node.gpu_util_pct, agent.node.gpu_power_w),
-        ));
-        if agent.gpu_vram_total_mib > 0.0 {
-            column = column.push(leader_row(
-                ICON_VRAM,
-                "GPU-VRAM",
-                &format!(
-                    "{:.0}/{:.0} GiB {:.0} %",
-                    agent.gpu_vram_used_mib / 1024.0,
-                    agent.gpu_vram_total_mib / 1024.0,
-                    agent.gpu_vram_used_mib / agent.gpu_vram_total_mib * 100.0
-                ),
-            ));
-        }
-        column = column.push(leader_row(
+        column = column.push(remote_gpu_table(agent));
+        column = column.push(value_row(
             ICON_POWER,
-            "GPU-Temperatur",
-            &format!("{:.0} °C · load {:.2}", agent.node.gpu_temp_c, agent.node.load1),
+            "Auslastung (1 min)",
+            &format!("{:.2}", agent.node.load1),
+            9,
         ));
     } else {
-        column = column.push(text::caption(
-            "Keine GPU-Werte: der Agent findet weder nvidia-smi noch eine GPU in /sys/class/drm.",
-        ));
+        column = column.push(value_row(ICON_GPU, "Grafikkarten", "keine erkannt", 14));
     }
 
     if agent.client_port > 0 || !agent.clients.is_empty() {
         let total: u32 = agent.clients.iter().map(|client| client.count).sum();
-        column = column.push(leader_row(
-            ICON_GPU,
-            "Clients an der Engine",
-            &format!("{total}"),
-        ));
+        column = column.push(value_row(ICON_GPU, "Clients an der Engine", &format!("{total}"), 6));
         for client in &agent.clients {
             let label = client_names
                 .iter()

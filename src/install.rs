@@ -325,17 +325,36 @@ fn push_file(
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(&local, content).map_err(|error| error.to_string())?;
-    let mut command = scp_command(request, files);
-    command.arg(&local);
-    command.arg(format!("{}:{}", request.target(), format!("{REMOTE_DIR}/{remote_name}")));
-    command.stdout(Stdio::null()).stderr(Stdio::piped());
-    let output = command.output().map_err(|error| error.to_string())?;
+    let attempt = |legacy: bool| -> Result<(), String> {
+        let mut command = scp_command(request, files);
+        if legacy {
+            // Some hosts (NAS systems) have a broken SFTP subsystem; the legacy
+            // scp protocol then works while the modern one fails with
+            // "dest open ... No such file or directory".
+            command.arg("-O");
+        }
+        command.arg(&local);
+        command.arg(format!("{}:{REMOTE_DIR}/{remote_name}", request.target()));
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let output = command.output().map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    };
+
+    let result = attempt(false).or_else(|error| {
+        log_once(&format!("Transfer mit SFTP fehlgeschlagen ({error}); versuche das alte scp-Protokoll"));
+        attempt(true)
+    });
     let _ = fs::remove_file(&local);
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
+    result
+}
+
+/// One-time log helper for functions without access to the install state.
+fn log_once(message: &str) {
+    eprintln!("[installer] {message}");
 }
 
 fn run(
@@ -456,40 +475,106 @@ fn install(
 
     log(state, "Prüfe den Dienst …");
     // The agent runs either as a system service or, on SELinux systems, as a
-    // user service. The remote command reports one machine-readable line.
+    // user service. A stale agent from an earlier installation can keep the
+    // port while the freshly installed unit fails to bind, so "unit active"
+    // plus "some listener exists" is not enough: the remote command also
+    // reports which process answers on the port and which version it prints.
+    thread::sleep(Duration::from_millis(300));
     let status = run_remote(
         request,
         files,
         "state=$(systemctl is-active megatron-sysmon-agent 2>/dev/null); \
-         [ \"$state\" = active ] || state=$(XDG_RUNTIME_DIR=/run/user/$(id -u) \
-             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus \
-             systemctl --user is-active megatron-sysmon-agent 2>/dev/null); \
+         if [ \"$state\" != active ]; then \
+             user_state=$(XDG_RUNTIME_DIR=/run/user/$(id -u) \
+                 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus \
+                 systemctl --user is-active megatron-sysmon-agent 2>/dev/null); \
+             [ \"$user_state\" = active ] && state=active; \
+         fi; \
+         lpid=$(ss -ltnp 2>/dev/null | grep -m1 -E ':8787([[:space:]]|$)' \
+             | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p'); \
+         ver=; cmd=; \
+         if [ -n \"$lpid\" ] && [ -r \"/proc/$lpid/cmdline\" ]; then \
+             cmd=$(tr '\\0' ' ' < \"/proc/$lpid/cmdline\" | cut -c1-160); \
+             lexe=$(readlink \"/proc/$lpid/exe\" 2>/dev/null); \
+             case \"$lexe\" in */megatron-sysmon-agent) \
+                 ver=$(\"$lexe\" --version 2>/dev/null | head -1);; esac; \
+         fi; \
          listeners=$(ss -ltn | grep -c ':8787' || true); \
-         echo \"state=${state:-unknown} listeners=${listeners}\"",
+         echo \"state=${state:-unknown}\"; echo \"listeners=${listeners:-0}\"; \
+         echo \"version=${ver}\"; echo \"cmd=${cmd}\"",
         None,
     )
     .unwrap_or_default();
-    let mut service_state = "unknown".to_owned();
-    let mut listeners = "0".to_owned();
-    for line in status.lines() {
-        let line = line.trim();
-        for field in line.split_whitespace() {
-            if let Some(value) = field.strip_prefix("state=") {
-                service_state = value.to_owned();
-            } else if let Some(value) = field.strip_prefix("listeners=") {
-                listeners = value.to_owned();
-            }
-        }
-    }
+    let probe = parse_probe(&status);
     log(
         state,
-        format!("Dienst: {service_state}, Port 8787: {listeners} Listener"),
+        format!(
+            "Dienst: {}, Port 8787: {} Listener, lauschender Agent: {}",
+            probe.state,
+            probe.listeners,
+            probe.running_version().unwrap_or("unbekannt")
+        ),
     );
-    if service_state != "active" {
-        return Err(format!("Dienst ist nicht aktiv ({service_state})"));
+    if probe.state != "active" {
+        return Err(format!("Dienst ist nicht aktiv ({})", probe.state));
     }
-    thread::sleep(Duration::from_millis(300));
+    if probe.listeners == 0 {
+        return Err("Kein Agent lauscht auf Port 8787, obwohl der Dienst aktiv ist.".to_owned());
+    }
+    if let Some(version) = probe.running_version() {
+        if compare_versions(version, expected_agent_version()) != std::cmp::Ordering::Equal {
+            return Err(format!(
+                "Auf Port 8787 antwortet Agent {version}, erwartet wird {} - \
+                 ein alter Agent hält den Port.",
+                expected_agent_version()
+            ));
+        }
+    } else if !probe.cmd.contains("megatron") {
+        return Err("Der Prozess auf Port 8787 ist nicht der Sysmon-Agent.".to_owned());
+    }
     Ok(())
+}
+
+/// Answer of the post-install probe: which unit is active, how many sockets
+/// listen on the agent port, and which process answers there.
+#[derive(Debug, Default)]
+struct PostInstallProbe {
+    state: String,
+    listeners: u32,
+    version: String,
+    cmd: String,
+}
+
+impl PostInstallProbe {
+    /// The version printed by the listening binary, when that binary is the
+    /// Rust agent (the Python fallback reports no version here; its command
+    /// line identifies it instead).
+    fn running_version(&self) -> Option<&str> {
+        self.version
+            .split_whitespace()
+            .next_back()
+            .filter(|value| value.chars().any(|c| c.is_ascii_digit()))
+    }
+}
+
+fn parse_probe(text: &str) -> PostInstallProbe {
+    let mut probe = PostInstallProbe {
+        state: "unknown".to_owned(),
+        ..Default::default()
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("state=") {
+            probe.state = value.to_owned();
+        } else if let Some(value) = line.strip_prefix("listeners=") {
+            probe.listeners = value.trim().parse().unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("version=") {
+            probe.version = value.trim().to_owned();
+        } else if let Some(value) = line.strip_prefix("cmd=") {
+            probe.cmd = value.trim().to_owned();
+        }
+    }
+    probe
 }
 
 #[cfg(test)]
@@ -513,6 +598,30 @@ mod tests {
         assert_eq!(agent_version_state(""), AgentVersionState::Unknown);
         assert_eq!(agent_version_state("0.9"), AgentVersionState::Outdated);
         assert_eq!(agent_version_state("99.0"), AgentVersionState::AppletOutdated);
+    }
+
+    #[test]
+    fn probe_names_the_listening_agent_version() {
+        let probe = parse_probe(concat!(
+            "state=active\n",
+            "listeners=1\n",
+            "version=megatron-sysmon-agent 2.2.0\n",
+            "cmd=/usr/local/lib/megatron-sysmon/megatron-sysmon-agent --bind 0.0.0.0\n",
+        ));
+        assert_eq!(probe.state, "active");
+        assert_eq!(probe.listeners, 1);
+        assert_eq!(probe.running_version(), Some("2.2.0"));
+    }
+
+    #[test]
+    fn probe_without_listener_or_version_stays_empty() {
+        let probe = parse_probe("state=activating\nlisteners=0\nversion=\ncmd=\n");
+        assert_eq!(probe.state, "activating");
+        assert_eq!(probe.listeners, 0);
+        assert_eq!(probe.running_version(), None);
+        let probe = parse_probe("nonsense output");
+        assert_eq!(probe.state, "unknown");
+        assert_eq!(probe.listeners, 0);
     }
 }
 

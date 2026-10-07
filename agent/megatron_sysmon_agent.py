@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import pwd
+import shutil
 import socket
 import struct
 import subprocess
@@ -47,7 +48,7 @@ import urllib.request
 # Reported to the applet, which enables the process actions from 2.2 on. The
 # fallback speaks the same protocol, so it must report the same API version as
 # the Rust agent (agent/rust/Cargo.toml).
-VERSION = "2.2.0"
+VERSION = "2.3.1"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Ports probed when looking for a local LLM server on the node.
@@ -96,6 +97,19 @@ def to_float(text: str) -> float:
         return float(number)
     except ValueError:
         return 0.0
+
+
+def read_text(path: str) -> str:
+    """Contents of a sysfs/proc file, empty when it does not exist.
+
+    Sysfs nodes come and go (a card without a power sensor, a driver that is
+    still binding), so a missing file is normal and never an error.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
 
 
 def read_meminfo() -> dict:
@@ -412,16 +426,26 @@ class ProcessCollector:
         return {"ok": True, "action": "kill", "pid": target, "signal": number}
 
 class GpuCollector:
-    """Reads GPU values from one long-running ``nvidia-smi --loop-ms`` process."""
+    """Reads GPU values from one long-running ``nvidia-smi --loop-ms`` process.
 
-    QUERY = "name,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks.current.sm"
+    Without ``nvidia-smi`` (for example on an AMD card with the amdgpu driver) the
+    values come from ``/sys/class/drm`` — the same source btop uses. Every card is
+    reported on its own in the ``gpus`` array, the flat fields stay as the
+    aggregate over all cards for older applets.
+    """
+
+    QUERY = "pci.bus_id,name,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks.current.sm"
 
     def __init__(self, interval_s: float) -> None:
         self.interval_ms = max(500, int(interval_s * 1000))
         self._lock = threading.Lock()
         self._state = {"available": False, "name": "", "util_pct": 0.0, "mem_util_pct": 0.0,
-                       "temp_c": 0.0, "power_w": 0.0, "sm_mhz": 0.0}
+                       "temp_c": 0.0, "power_w": 0.0, "sm_mhz": 0.0, "vram_used_mib": 0.0,
+                       "vram_total_mib": 0.0, "gpus": []}
         self._stop = threading.Event()
+        self._round = []
+        self._cards = 0
+        self._sysfs = None
 
     def start(self) -> None:
         threading.Thread(target=self._run, name="gpu", daemon=True).start()
@@ -431,10 +455,40 @@ class GpuCollector:
 
     def sample(self) -> dict:
         with self._lock:
-            return dict(self._state)
+            state = dict(self._state)
+            state["gpus"] = [dict(item) for item in self._state["gpus"]]
+            return state
+
+    def _publish(self, entries: list) -> None:
+        """Aggregates the cards of one round and publishes them."""
+        if not entries:
+            return
+        state = {
+            "available": True,
+            "name": entries[0]["name"] if len(entries) == 1
+                    else "%s (+%d)" % (entries[0]["name"], len(entries) - 1),
+            "util_pct": max(entry["util_pct"] for entry in entries),
+            "mem_util_pct": 0.0,
+            "temp_c": max(entry["temp_c"] for entry in entries),
+            "power_w": round(sum(entry["power_w"] for entry in entries), 2),
+            "sm_mhz": 0.0,
+            "vram_used_mib": sum(entry["vram_used_mib"] for entry in entries),
+            "vram_total_mib": sum(entry["vram_total_mib"] for entry in entries),
+            "gpus": entries,
+        }
+        if state["vram_total_mib"] > 0:
+            state["mem_util_pct"] = round(
+                state["vram_used_mib"] / state["vram_total_mib"] * 100.0, 2)
+        with self._lock:
+            self._state = state
 
     def _run(self) -> None:
-        command = ["nvidia-smi", f"--query-gpu={self.QUERY}", "--format=csv,noheader",
+        path = shutil.which("nvidia-smi")
+        if path is None:
+            self._run_sysfs()
+            return
+
+        command = [path, f"--query-gpu={self.QUERY}", "--format=csv,noheader",
                    f"--loop-ms={self.interval_ms}"]
         while not self._stop.is_set():
             try:
@@ -443,24 +497,28 @@ class GpuCollector:
                     text=True, bufsize=1,
                 )
             except (OSError, ValueError):
-                log("nvidia-smi is not available; GPU values stay empty")
+                log("nvidia-smi is not available; reading GPUs from sysfs instead")
+                self._run_sysfs()
                 return
             try:
                 for line in process.stdout:  # type: ignore[union-attr]
                     fields = [field.strip() for field in line.split(",")]
-                    if len(fields) < 6:
+                    if len(fields) < 7:
                         continue
-                    state = {
-                        "available": True,
-                        "name": fields[0],
-                        "util_pct": round(to_float(fields[1]), 1),
-                        "mem_util_pct": round(to_float(fields[2]), 1),
-                        "temp_c": round(to_float(fields[3]), 1),
-                        "power_w": round(to_float(fields[4]), 2),
-                        "sm_mhz": round(to_float(fields[5]), 1),
-                    }
-                    with self._lock:
-                        self._state = state
+                    # Every line is one card; the round is complete when the
+                    # announced number of cards was read.
+                    self._round.append({
+                        "slot": fields[0],
+                        "name": fields[1],
+                        "util_pct": round(to_float(fields[2]), 1),
+                        "vram_used_mib": 0.0,
+                        "vram_total_mib": 0.0,
+                        "temp_c": round(to_float(fields[4]), 1),
+                        "power_w": round(to_float(fields[5]), 2),
+                    })
+                    if len(self._round) >= max(1, self._cards):
+                        entries, self._round = self._round, []
+                        self._publish(entries)
                     if self._stop.is_set():
                         break
             finally:
@@ -471,6 +529,100 @@ class GpuCollector:
                     process.kill()
             if not self._stop.is_set():
                 time.sleep(5)
+
+    # -- sysfs fallback ----------------------------------------------------
+
+    def _run_sysfs(self) -> None:
+        """Samples every amdgpu/Intel card directly from /sys/class/drm."""
+        cards = discover_sysfs_gpus()
+        if not cards:
+            log("neither nvidia-smi nor a supported GPU in sysfs")
+            return
+        log("gpu: %d sysfs GPU(s) without nvidia-smi" % len(cards))
+        while not self._stop.is_set():
+            self._publish([read_sysfs_gpu(card) for card in cards])
+            if self._stop.wait(max(1.0, self.interval_ms / 1000.0)):
+                return
+
+
+def discover_sysfs_gpus() -> list:
+    """Every ``cardN`` backed by amdgpu or i915, sorted by PCI address."""
+    cards = []
+    try:
+        names = sorted(os.listdir("/sys/class/drm"))
+    except OSError:
+        return cards
+
+    for name in names:
+        if not name.startswith("card") or "-" in name or not name[4:].isdigit():
+            continue
+        device = os.path.join("/sys/class/drm", name, "device")
+        vendor = read_text(os.path.join(device, "vendor")).lower()
+        if vendor not in ("0x1002", "0x8086"):
+            continue
+        slot = os.path.realpath(device).rsplit("/", 1)[-1]
+        cards.append({
+            "slot": slot,
+            "name": sysfs_gpu_name(slot, vendor),
+            "busy": os.path.join(device, "gpu_busy_percent"),
+            "vram_used": os.path.join(device, "mem_info_vram_used"),
+            "vram_total": os.path.join(device, "mem_info_vram_total"),
+            "hwmon": os.path.join(device, "hwmon"),
+        })
+    cards.sort(key=lambda card: card["slot"])
+    return cards
+
+
+def sysfs_gpu_name(slot: str, vendor: str) -> str:
+    """Marketing name from ``lspci``, trimmed to the part people recognise."""
+    try:
+        output = subprocess.run(["lspci", "-s", slot, "-mm"], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, timeout=5)
+        if output.returncode == 0:
+            parts = output.stdout.split('"')
+            if len(parts) >= 6:
+                model = parts[5].strip()
+                if model and not model.startswith("Device"):
+                    if "[" in model and "]" in model:
+                        return model[model.index("[") + 1:model.rindex("]")].strip()
+                    return model
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "%s GPU" % ("AMD" if vendor == "0x1002" else "Intel")
+
+
+def read_sysfs_gpu(card: dict) -> dict:
+    """Load, VRAM, temperature and board power of one card in this moment."""
+    power = 0.0
+    temperature = 0.0
+    try:
+        for hwmon in sorted(os.listdir(card["hwmon"])):
+            base = os.path.join(card["hwmon"], hwmon)
+            # power1_average is the smoothed value, power1_input the instant one.
+            for candidate in ("power1_average", "power1_input"):
+                value = read_text(os.path.join(base, candidate)).strip()
+                if value:
+                    power = to_float(value) / 1_000_000.0
+                    break
+            value = read_text(os.path.join(base, "temp1_input")).strip()
+            if value:
+                temperature = to_float(value) / 1000.0
+            if power or temperature:
+                break
+    except OSError:
+        pass
+
+    vram_used = to_float(read_text(card["vram_used"])) / 1024.0 / 1024.0
+    vram_total = to_float(read_text(card["vram_total"])) / 1024.0 / 1024.0
+    return {
+        "slot": card["slot"],
+        "name": card["name"],
+        "util_pct": round(to_float(read_text(card["busy"])), 1),
+        "vram_used_mib": round(vram_used, 1),
+        "vram_total_mib": round(vram_total, 1),
+        "temp_c": round(temperature, 1),
+        "power_w": round(power, 2),
+    }
 
 
 def http_json(url: str, timeout: float) -> dict | None:
@@ -777,6 +929,19 @@ class Agent:
         self.discovery.start(follow)
 
     def snapshot(self) -> dict:
+        gpu = self.gpu.sample()
+        gpus = [
+            {
+                "slot": entry.get("slot", ""),
+                "name": entry.get("name", ""),
+                "util_pct": entry.get("util_pct", 0.0),
+                "vram_used_mib": entry.get("vram_used_mib", 0.0),
+                "vram_total_mib": entry.get("vram_total_mib", 0.0),
+                "temp_c": entry.get("temp_c", 0.0),
+                "power_w": entry.get("power_w", 0.0),
+            }
+            for entry in gpu.pop("gpus", [])
+        ]
         document = {
             "agent": "megatron-sysmon",
             "version": VERSION,
@@ -784,7 +949,9 @@ class Agent:
             "ts": round(time.time(), 3),
             "uptime_s": round(self.node._uptime(), 1),
             "node": self.node.sample(),
-            "gpu": self.gpu.sample(),
+            "gpu": gpu,
+            # Every card on its own; agents before 2.3 do not send this field.
+            "gpus": gpus,
             "vllm": self.vllm.sample() if (self.args.vllm_url or self.args.discover) else {
                 "available": False,
                 "reason": "disabled",

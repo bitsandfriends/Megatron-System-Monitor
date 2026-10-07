@@ -142,6 +142,14 @@ fn now_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// `0000:03:00.0` of a PCI device directory, e.g. `/sys/class/drm/card1/device`.
+fn pci_slot_of(device: &std::path::Path) -> String {
+    std::fs::canonicalize(device)
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
 /// Readable processor name.
 ///
 /// x86 exposes a marketing name in `/proc/cpuinfo`; arm64 usually does not, so
@@ -306,6 +314,97 @@ struct GpuState {
     vram_total_mib: f64,
     /// `nvidia`, `amd`, `intel` or empty when nothing was found.
     vendor: String,
+    /// Every card with its own values, in detection order. Empty when the
+    /// backend cannot report per-card values; then only the aggregate above is
+    /// filled and the applet falls back to its old single line.
+    gpus: Vec<GpuEntry>,
+    /// Cards of the round that is currently being read (`nvidia-smi --loop-ms`
+    /// prints all cards back to back with no separator).
+    round: Vec<GpuEntry>,
+    /// How many cards the backend announced.
+    card_count: usize,
+}
+
+/// One graphics card with its own values.
+#[derive(Default, Clone)]
+struct GpuEntry {
+    /// PCI address, e.g. `0000:03:00.0`.
+    slot: String,
+    name: String,
+    util_pct: f64,
+    vram_used_mib: f64,
+    vram_total_mib: f64,
+    temp_c: f64,
+    power_w: f64,
+}
+
+impl GpuEntry {
+    /// One element of the `gpus` array in the pushed document.
+    fn to_json(&self) -> Value {
+        json!({
+            "slot": self.slot,
+            "name": self.name,
+            "util_pct": self.util_pct,
+            "vram_used_mib": self.vram_used_mib,
+            "vram_total_mib": self.vram_total_mib,
+            "temp_c": self.temp_c,
+            "power_w": self.power_w,
+        })
+    }
+}
+
+/// Adds one reported card to the round that is currently being read.
+///
+/// `card_count` is how many cards the backend announced, so a round is complete
+/// as soon as it holds that many cards.
+fn push_round(state: &mut GpuState, entry: GpuEntry, card_count: usize) {
+    state.round.push(entry);
+    let expected = card_count.max(1);
+    if state.round.len() >= expected {
+        finish_round(state);
+    }
+}
+
+/// Turns the cards of the current round into the published values.
+fn finish_round(state: &mut GpuState) {
+    if !state.round.is_empty() {
+        state.gpus = state.round.clone();
+        state.round.clear();
+    }
+    if state.gpus.is_empty() {
+        return;
+    }
+
+    let mut vram_used = 0.0;
+    let mut vram_total = 0.0;
+    let mut power = 0.0;
+    let mut temperature: f64 = 0.0;
+    for gpu in &state.gpus {
+        state.util_pct = state.util_pct.max(gpu.util_pct);
+        vram_used += gpu.vram_used_mib;
+        vram_total += gpu.vram_total_mib;
+        power += gpu.power_w;
+        if gpu.temp_c > 0.0 {
+            temperature = if temperature > 0.0 {
+                temperature.max(gpu.temp_c)
+            } else {
+                gpu.temp_c
+            };
+        }
+    }
+    state.vram_used_mib = vram_used;
+    state.vram_total_mib = vram_total;
+    state.power_w = power;
+    state.temp_c = temperature;
+    if vram_total > 0.0 {
+        state.mem_util_pct = vram_used / vram_total * 100.0;
+    }
+    state.name = match state.gpus.as_slice() {
+        [] => String::new(),
+        [only] => only.name.clone(),
+        [first, rest @ ..] => format!("{} (+{})", first.name, rest.len()),
+    };
+    state.available = true;
 }
 
 /// One long-running `nvidia-smi` instead of a process per sample.
@@ -333,9 +432,9 @@ impl GpuCollector {
                 // per sample. If it is unavailable, AMD/Intel GPUs are read from
                 // sysfs (utilization, VRAM, power, temperature).
                 match nvidia_fields() {
-                    Some(fields) => {
-                        log(&format!("gpu: nvidia-smi with {fields}"));
-                        nvidia_loop(&state, &stop, &last_client_seen, &fields, interval_ms);
+                    Some((fields, card_count)) => {
+                        log(&format!("gpu: nvidia-smi with {fields} ({card_count} card(s))"));
+                        nvidia_loop(&state, &stop, &last_client_seen, &fields, card_count, interval_ms);
                     }
                     None => {
                         let gpus = sysfs_gpus();
@@ -367,11 +466,13 @@ impl GpuCollector {
 }
 
 /// Field list for `nvidia-smi --query-gpu`, reduced until the driver accepts it.
-fn nvidia_fields() -> Option<String> {
-    const CANDIDATES: [&str; 3] = [
+fn nvidia_fields() -> Option<(String, usize)> {
+    // `pci.bus_id` first, so a card can be told apart by its slot later.
+    const CANDIDATES: [&str; 4] = [
+        "pci.bus_id,name,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks.current.sm,memory.used,memory.total",
+        "pci.bus_id,name,utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total",
         "name,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks.current.sm,memory.used,memory.total",
         "name,utilization.gpu,temperature.gpu,memory.used,memory.total",
-        "name,memory.used,memory.total",
     ];
     for fields in CANDIDATES {
         let output = Command::new("nvidia-smi")
@@ -383,8 +484,13 @@ fn nvidia_fields() -> Option<String> {
             .stderr(Stdio::null())
             .output();
         if let Ok(output) = output {
-            if output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-                return Some(fields.to_owned());
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                // One line per card, so the line count is the card count.
+                let cards = text.lines().filter(|line| !line.trim().is_empty()).count();
+                if cards > 0 {
+                    return Some((fields.to_owned(), cards));
+                }
             }
         }
     }
@@ -396,6 +502,7 @@ fn nvidia_loop(
     stop: &Arc<AtomicBool>,
     last_client_seen: &Arc<AtomicU64>,
     fields: &str,
+    card_count: usize,
     interval_ms: u64,
 ) {
     while !stop.load(Ordering::Relaxed) {
@@ -423,7 +530,15 @@ fn nvidia_loop(
                 }
                 if let Some(sample) = parse_nvidia_line(&line, fields) {
                     if let Ok(mut guard) = state.lock() {
-                        *guard = sample;
+                        // `nvidia-smi --loop-ms` prints every card of a round
+                        // back to back, so each line adds one card.
+                        for entry in sample.gpus {
+                            push_round(&mut guard, entry, card_count);
+                        }
+                        if guard.vendor.is_empty() {
+                            guard.vendor = sample.vendor.clone();
+                        }
+                        guard.available = true;
                     }
                 }
             }
@@ -435,35 +550,44 @@ fn nvidia_loop(
 }
 
 /// `nounits` keeps the values numeric, so the position decides the meaning.
+///
+/// One line of `nvidia-smi` is exactly one card, so the result holds one entry.
 fn parse_nvidia_line(line: &str, fields: &str) -> Option<GpuState> {
     let values: Vec<&str> = line.split(',').map(str::trim).collect();
     let names: Vec<&str> = fields.split(',').collect();
     if values.len() < names.len() {
         return None;
     }
-    let mut sample = GpuState {
-        available: true,
-        vendor: "nvidia".to_owned(),
-        ..GpuState::default()
-    };
+    let mut entry = GpuEntry::default();
+    let mut sm_mhz = 0.0;
     for (name, value) in names.iter().zip(values.iter()) {
         match *name {
-            "name" => sample.name = (*value).to_owned(),
-            "utilization.gpu" => sample.util_pct = number(value),
-            "utilization.memory" => sample.mem_util_pct = number(value),
-            "temperature.gpu" => sample.temp_c = number(value),
-            "power.draw" => sample.power_w = number(value),
-            "clocks.current.sm" => sample.sm_mhz = number(value),
-            "memory.used" => sample.vram_used_mib = number(value),
-            "memory.total" => sample.vram_total_mib = number(value),
+            "name" => entry.name = (*value).to_owned(),
+            "pci.bus_id" => entry.slot = (*value).to_owned(),
+            "utilization.gpu" => entry.util_pct = number(value),
+            "temperature.gpu" => entry.temp_c = number(value),
+            "power.draw" => entry.power_w = number(value),
+            "clocks.current.sm" => sm_mhz = number(value),
+            "memory.used" => entry.vram_used_mib = number(value),
+            "memory.total" => entry.vram_total_mib = number(value),
             _ => {}
         }
     }
+    let mut sample = GpuState {
+        available: true,
+        vendor: "nvidia".to_owned(),
+        name: entry.name.clone(),
+        sm_mhz,
+        gpus: vec![entry],
+        ..GpuState::default()
+    };
+    sample.card_count = 1;
     Some(sample)
 }
 
 /// One AMD/Intel GPU found in sysfs.
 struct SysfsGpu {
+    slot: String,
     name: String,
     vendor: String,
     busy: PathBuf,
@@ -511,6 +635,7 @@ fn sysfs_gpus() -> Vec<SysfsGpu> {
             }
         }
         gpus.push(SysfsGpu {
+            slot: pci_slot_of(&device),
             name: pci_name(&device, &device_id, vendor),
             vendor: vendor.to_owned(),
             busy: device.join("gpu_busy_percent"),
@@ -520,12 +645,13 @@ fn sysfs_gpus() -> Vec<SysfsGpu> {
             temp,
         });
     }
+    // Stable order by PCI address, so card 1 stays card 1 between samples.
+    gpus.sort_by(|left, right| left.slot.cmp(&right.slot));
     gpus
 }
 
 /// Marketing name from `lspci` when available, else a readable fallback.
-fn pci_name(device: &std::path::Path, device_id: &str, vendor: &str) -> String {
-    let slot = std::fs::canonicalize(device)
+fn pci_name(device: &std::path::Path, device_id: &str, vendor: &str) -> String {    let slot = std::fs::canonicalize(device)
         .ok()
         .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
         .unwrap_or_default();
@@ -551,7 +677,7 @@ fn pci_name(device: &std::path::Path, device_id: &str, vendor: &str) -> String {
                     if device.is_empty() || device.starts_with("Device") {
                         return format!("{} {}", vendor.to_uppercase(), device).trim().to_owned();
                     }
-                    return device.to_owned();
+                    return trim_code_name(device);
                 }
             }
         }
@@ -560,35 +686,45 @@ fn pci_name(device: &std::path::Path, device_id: &str, vendor: &str) -> String {
     format!("{vendor_name} GPU {device_id}")
 }
 
-/// Aggregates all sysfs GPUs: highest utilization, summed VRAM and power.
+/// `Navi 48 [Radeon AI PRO R9700]` becomes `Radeon AI PRO R9700`.
+///
+/// The part in front of the bracket is the internal code name, which means
+/// nothing to a reader; the applet shows the marketed name.
+fn trim_code_name(name: &str) -> String {
+    match (name.find('['), name.rfind(']')) {
+        (Some(start), Some(end)) if end > start + 1 => name[start + 1..end].trim().to_owned(),
+        _ => name.trim().to_owned(),
+    }
+}
+
+/// Reads every sysfs GPU: per card plus the aggregate over all cards.
 fn sample_sysfs(gpus: &[SysfsGpu]) -> GpuState {
     let mut sample = GpuState {
         available: true,
         vendor: gpus.first().map(|gpu| gpu.vendor.clone()).unwrap_or_default(),
+        card_count: gpus.len(),
         ..GpuState::default()
     };
-    let mut names = Vec::new();
+
     for gpu in gpus {
-        names.push(gpu.name.clone());
-        sample.util_pct = sample.util_pct.max(read_number(&gpu.busy));
-        sample.vram_used_mib += read_number(&gpu.vram_used) / 1024.0 / 1024.0;
-        sample.vram_total_mib += read_number(&gpu.vram_total) / 1024.0 / 1024.0;
+        // Prefer the smoothed node like btop, but accept either one.
         let watts = if gpu.power.join("power1_average").exists() {
             read_number(&gpu.power.join("power1_average")) / 1_000_000.0
         } else {
             read_number(&gpu.power.join("power1_input")) / 1_000_000.0
         };
-        sample.power_w += watts;
-        sample.temp_c = sample.temp_c.max(read_number(&gpu.temp.join("temp1_input")) / 1000.0);
+        sample.gpus.push(GpuEntry {
+            slot: gpu.slot.clone(),
+            name: gpu.name.clone(),
+            util_pct: read_number(&gpu.busy),
+            vram_used_mib: read_number(&gpu.vram_used) / 1024.0 / 1024.0,
+            vram_total_mib: read_number(&gpu.vram_total) / 1024.0 / 1024.0,
+            temp_c: read_number(&gpu.temp.join("temp1_input")) / 1000.0,
+            power_w: watts,
+        });
     }
-    sample.name = if names.len() > 1 {
-        format!("{} (+{})", names[0], names.len() - 1)
-    } else {
-        names.first().cloned().unwrap_or_default()
-    };
-    if sample.vram_total_mib > 0.0 {
-        sample.mem_util_pct = sample.vram_used_mib / sample.vram_total_mib * 100.0;
-    }
+
+    finish_round(&mut sample);
     sample
 }
 
@@ -1699,6 +1835,9 @@ fn build_snapshot(node: &mut NodeCollector, gpu: &GpuCollector, llm: &LlmCollect
             "vram_total_mib": gpu_state.vram_total_mib,
             "vendor": gpu_state.vendor,
         },
+        // Per card values; empty when the backend reports only aggregates.
+        // Agents before 2.3 do not send this field at all.
+        "gpus": gpu_state.gpus.iter().map(GpuEntry::to_json).collect::<Vec<Value>>(),
         "llm": {
             "autodiscover": args.discover,
             "endpoint": llm.current_url(),
